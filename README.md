@@ -19,7 +19,7 @@ This project is managed with [uv](https://github.com/astral-sh/uv).
 
 ```bash
 # Clone the repository
-git clone <repo-url>
+git clone git@github.com:ryanm101/samrenderer.git
 cd samrenderer
 
 # Install dependencies and sync environment
@@ -38,7 +38,7 @@ Resolves parameters using defaults defined in the template.uv run sam-render tem
 
 Applies parameters from `[<env>.deploy.parameters]` in `samconfig.toml`.
 
-```bash 
+```bash
 uv run sam-render examples/template.yaml --config examples/samconfig.toml --env dev
 ```
 
