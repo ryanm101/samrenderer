@@ -24,5 +24,8 @@ dev = [
     "ruff>=0.14.5",
 ]
 
+[tool.pytest.ini_options]
+addopts = "--cov=samrenderer --cov-report=term-missing --cov-fail-under=80"
+
 [project.scripts]
 sam-render = "samrenderer.main:main"
