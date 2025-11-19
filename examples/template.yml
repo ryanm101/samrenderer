@@ -1,0 +1,104 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Example SAM Template compatible with the provided samconfig.toml
+
+# 1. Define Parameters to match 'parameter_overrides' in samconfig.toml
+Parameters:
+  VpcStackName:
+    Type: String
+    Description: Source stack name for VPC resources
+  CodeSigningConfigArn:
+    Type: String
+    Description: The ARN of the code signing configuration
+  PermissionsBoundary:
+    Type: String
+    Description: The ARN of the IAM permissions boundary to apply to roles
+  Environment:
+    Type: String
+    Description: The deployment environment (e.g., dev)
+  # Added SubEnvironment to support the logic examples
+  SubEnvironment:
+    Type: String
+    Default: none
+    Description: Optional sub-environment (e.g., pr-123)
+
+Mappings:
+  EnvironmentConfiguration:
+    dev:
+      Key: Val
+      cloudwatchLogRetentionInDays: 7
+    stag:
+      Key: Val
+      cloudwatchLogRetentionInDays: 14
+    Prod:
+       Key: Val
+       cloudwatchLogRetentionInDays: 30
+
+Conditions:
+  # Basic check: is SubEnvironment not equal to 'none'?
+  UseSubEnvironment: !Not [!Equals [!Ref SubEnvironment, none]]
+
+# 2. Apply common configs globally
+Globals:
+  Function:
+    # Automatically applies the boundary to all functions in this template
+    PermissionsBoundary: !Ref PermissionsBoundary
+    Environment:
+      Variables:
+        # Inject the Environment parameter into all functions
+        APP_ENV: !Ref Environment
+
+Resources:
+  # 3. Logical ID 'APIFunction' matches the key in 'signing_profiles'
+  APIFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.handler
+      Runtime: python3.11
+      # 4. Use the CodeSigningConfigArn parameter
+      CodeSigningConfigArn: !Ref CodeSigningConfigArn
+      Environment:
+        Variables:
+          # Example usage of the VpcStackName parameter
+          VPC_STACK_ID: !Ref VpcStackName
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /test
+            Method: get
+
+  # Simple IAM Role to demonstrate PermissionsBoundary usage
+  APIFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      # Explicitly using the boundary parameter
+      PermissionsBoundary: !Ref PermissionsBoundary
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # 5. NEW: LogGroup utilizing your specific lookup patterns
+  APIFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      # Pattern 2: !Sub with !If logic in the variable map
+      LogGroupName: !Sub
+        - /aws/lambda/${Env}-APIFunction-lambda
+        - Env: !If
+            - UseSubEnvironment
+            - !Ref SubEnvironment
+            - !Ref Environment
+      # Pattern 1: !FindInMap using !Ref for the key
+      RetentionInDays: !FindInMap
+        - EnvironmentConfiguration
+        - !Ref Environment
+        - cloudwatchLogRetentionInDays
