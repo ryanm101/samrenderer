@@ -28,6 +28,9 @@ Mappings:
     dev:
       Key: Val
       cloudwatchLogRetentionInDays: 7
+    dev1:
+      Key: Val
+      cloudwatchLogRetentionInDays: 12
     stag:
       Key: Val
       cloudwatchLogRetentionInDays: 14
@@ -36,8 +39,15 @@ Mappings:
        cloudwatchLogRetentionInDays: 30
 
 Conditions:
-  # Basic check: is SubEnvironment not equal to 'none'?
-  UseSubEnvironment: !Not [!Equals [!Ref SubEnvironment, none]]
+  # Updated check: Must be 'dev' env AND SubEnvironment must not be 'none'
+  UseSubEnvironment: !And
+    - !Equals
+      - !Ref Environment
+      - dev
+    - !Not
+      - !Equals
+        - !Ref SubEnvironment
+        - none
 
 # 2. Apply common configs globally
 Globals:
@@ -98,7 +108,14 @@ Resources:
             - !Ref SubEnvironment
             - !Ref Environment
       # Pattern 1: !FindInMap using !Ref for the key
-      RetentionInDays: !FindInMap
-        - EnvironmentConfiguration
-        - !Ref Environment
-        - cloudwatchLogRetentionInDays
+      # Note: This uses 'Environment' (dev) directly, ignoring 'SubEnvironment' (dev1)
+      RetentionInDays: !If
+        - UseSubEnvironment
+        - !FindInMap
+          - EnvironmentConfiguration
+          - !Ref SubEnvironment
+          - cloudwatchLogRetentionInDays
+        - !FindInMap
+          - EnvironmentConfiguration
+          - !Ref Environment
+          - cloudwatchLogRetentionInDays

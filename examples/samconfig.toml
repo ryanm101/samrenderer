@@ -10,6 +10,17 @@ parameter_overrides = "VpcStackName=\"vpc\" CodeSigningConfigArn=\"arn:aws:lambd
 image_repositories = []
 signing_profiles = "APIFunction=\"SigningProfile_dev\""
 
+[dev1.deploy.parameters]
+stack_name = "dev-apistack"
+resolve_s3 = false
+s3_bucket = "dev-apibucket"
+region = "eu-west-2"
+confirm_changeset = true
+capabilities = "CAPABILITY_NAMED_IAM"
+parameter_overrides = "VpcStackName=\"vpc\" CodeSigningConfigArn=\"arn:aws:lambda:eu-west-2:1234:code-signing-config:csc-1234\" PermissionsBoundary=\"arn:aws:iam::1234:policy/api-AppProgrammaticPermissionsBoundary-1234\" Environment=\"dev\" SubEnvironment=\"dev1\""
+image_repositories = []
+signing_profiles = "APIFunction=\"SigningProfile_dev\""
+
 [stag.deploy.parameters]
 stack_name = "stag-apistack"
 resolve_s3 = false

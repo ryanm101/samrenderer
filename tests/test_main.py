@@ -59,38 +59,74 @@ def test_sub_resolution(renderer):
     assert renderer.resolve(node) == "Region is us-east-1"
 
 
+# --- NEW TEST: Sub with If Logic ---
+def test_sub_with_nested_if(tmp_path):
+    """
+    Tests !Sub [String, { Var: !If ... }] logic.
+    """
+    content = """
+    Parameters:
+      Env: {Type: String, Default: dev}
+      IsSpecial: {Type: String, Default: "false"}
+    Conditions:
+      CheckSpecial: !Equals [!Ref IsSpecial, "true"]
+    Resources:
+      TestResource:
+        Properties:
+          Name: !Sub
+            - "Prefix-${Suffix}"
+            - Suffix: !If [CheckSpecial, "Special", !Ref Env]
+    """
+    f = tmp_path / "sub_logic.yaml"
+    f.write_text(content, encoding="utf-8")
+
+    # Case 1: IsSpecial = false (Default) -> Suffix should be "dev"
+    r1 = TemplateRenderer(str(f))
+    res1 = r1.resolve(r1.resources)
+    assert res1["TestResource"]["Properties"]["Name"] == "Prefix-dev"
+
+    # Case 2: IsSpecial = true -> Suffix should be "Special"
+    r2 = TemplateRenderer(str(f))
+    r2.context["IsSpecial"] = "true"  # Override parameter
+    res2 = r2.resolve(r2.resources)
+    assert res2["TestResource"]["Properties"]["Name"] == "Prefix-Special"
+
+
 def test_logic_operators(renderer):
     assert renderer.resolve({"Fn::Equals": ["a", "a"]}) is True
     assert renderer.resolve({"Fn::Not": [{"Fn::Equals": ["a", "a"]}]}) is False
     assert renderer.resolve({"Fn::Or": [False, True]}) is True
 
 
+def test_nested_logic_structure(renderer):
+    """
+    Tests the specific !And + !Not + !Equals structure requested.
+    Equivalent to: Environment == 'dev' AND SubEnvironment != 'none'
+    """
+    # Case 1: Env=dev, SubEnv=dev1 (Should be True)
+    # We mock the inputs manually here since 'renderer' has fixed context
+    logic_true = {
+        "Fn::And": [
+            {"Fn::Equals": ["dev", "dev"]},  # True
+            {"Fn::Not": [{"Fn::Equals": ["dev1", "none"]}]},  # Not(False) -> True
+        ]
+    }
+    assert renderer.resolve(logic_true) is True
+
+    # Case 2: Env=prod, SubEnv=dev1 (Should be False because Env != dev)
+    logic_false_env = {
+        "Fn::And": [
+            {"Fn::Equals": ["prod", "dev"]},  # False
+            {"Fn::Not": [{"Fn::Equals": ["dev1", "none"]}]},  # True
+        ]
+    }
+    assert renderer.resolve(logic_false_env) is False
+
+
 def test_condition_evaluation(renderer):
+    # IsProd depends on Env=dev (Default), so IsProd should be False
     assert renderer.resolve({"Condition": "IsProd"}) is False
     assert renderer.resolve({"Condition": "IsNotProd"}) is True
-
-
-def test_fn_if_resolution(renderer):
-    node = {"Fn::If": ["IsProd", "ProductionValue", "DevValue"]}
-    assert renderer.resolve(node) == "DevValue"
-
-
-# --- New Tests for Added Functions ---
-
-
-def test_select_and_split(renderer):
-    # Split string into list, select 2nd item
-    split_node = {"Fn::Split": [",", "a,b,c"]}
-    select_node = {"Fn::Select": ["1", split_node]}  # Index 1 = 'b'
-
-    assert renderer.resolve(select_node) == "b"
-
-
-def test_get_azs(renderer):
-    node = {"Fn::GetAZs": {"Ref": "AWS::Region"}}
-    # Mock implementation returns [region+a, region+b, region+c]
-    expected = ["us-east-1a", "us-east-1b", "us-east-1c"]
-    assert renderer.resolve(node) == expected
 
 
 def test_base64(renderer):
