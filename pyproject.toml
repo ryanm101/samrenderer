@@ -2,6 +2,12 @@
 name = "samrenderer"
 version = "0.1.0"
 description = "A tool to render SAM templates locally with SAM config overrides"
+maintainers = [
+  {name = "Ryan McLean", email = "ryan1_00@hotmail.com"}
+]
+license = "MIT"
+license-files = ["LICEN[CS]E*"]
+keywords = ["SAM", "AWS", "Cloudformation", "Serverless Application Model"]
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -9,6 +15,15 @@ dependencies = [
     "pyyaml>=6.0.3",
     "tomli>=2.3.0",
 ]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Topic :: Software Development :: Build Tools",
+  "Programming Language :: Python :: 3.11",
+]
+[project.urls]
+Repository = "https://github.com/ryanm101/samrenderer.git"
+Issues = "https://github.com/ryanm101/samrenderer/issues"
 
 [build-system]
 requires = ["hatchling"]
