@@ -1,6 +1,6 @@
 [project]
 name = "samrenderer"
-version = "0.1.0"
+version = "0.0.0-dev"
 description = "A tool to render SAM templates locally with SAM config overrides"
 maintainers = [
   {name = "Ryan McLean", email = "ryan1_00@hotmail.com"}

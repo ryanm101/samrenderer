@@ -31,6 +31,23 @@ jobs:
       - name: Run tests
         run: make test
 
+      - name: Sync Project Version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF_NAME#v}
+            echo "Type: Tagged Release"
+
+          # 2. If not a tag, use Last Tag + -dev (e.g. 1.0.0-dev)
+          else
+            LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+            VERSION="${LAST_TAG#v}-dev"
+            echo "Type: Dev Build (Last tag: $LAST_TAG)"
+          fi
+
+          echo "Syncing pyproject.toml to version: $VERSION"
+          uv version "$VERSION"
+          uv version
+
       - name: Build package
         run: make build
 
