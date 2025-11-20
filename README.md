@@ -61,7 +61,16 @@ uv run sam-render template.yaml --config samconfig.toml --env dev --env2 stag
 By default, `Fn::ImportValue` and `{{resolve:secretsmanager:...}}` return mock strings. Provide an AWS profile to fetch real values from your AWS account.
 
 ```bash
+# Single Env, single acccout
 uv run sam-render template.yaml --config samconfig.toml --env dev --profile my-aws-profile
+
+# Compare Envs in a single account
+uv run sam-render template.yaml --config samconfig.toml --env dev --env2 dev1 --profile my-aws-profile
+
+# Compare Envs in different accounts
+uv run sam-render template.yaml --config samconfig.toml --env dev --env2 dev1 --profile my-aws-profile --profile2 my-aws-profile2
+
+
 ```
 
 ## **Supported Functions**
