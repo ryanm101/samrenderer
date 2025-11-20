@@ -4,12 +4,25 @@ import re
 import sys
 import argparse
 import difflib
+import json
 import asyncio
+import subprocess
+from botocore.exceptions import ClientError, BotoCoreError
 
 try:
     import tomllib as toml  # Python 3.11+
 except ImportError:  # pragma: no cover
     import tomli as toml  # pip install tomli
+
+# Constants for log levels
+LOG_LEVELS = {
+    "DEBUG": 10,
+    "INFO": 20,
+    "WARN": 30,
+    "WARNING": 30,
+    "ERROR": 40,
+    "CRITICAL": 50,
+}
 
 
 # --- 1. YAML Tag Handling ---
@@ -47,8 +60,11 @@ def parse_sam_overrides(override_string):
     if not override_string:
         return {}
 
-    pattern = re.compile(r"([a-zA-Z0-9]+)=\"([^\"]*)\"")
-    return dict(pattern.findall(override_string))
+    pattern = re.compile(r"([a-zA-Z0-9\-_]+)=(?:\"([^\"]*)\"|([^\s\"]+))")
+
+    matches = pattern.findall(override_string)
+
+    return {m[0]: m[1] or m[2] for m in matches}
 
 
 def load_sam_config(config_path, environment="default"):
@@ -76,13 +92,27 @@ def load_sam_config(config_path, environment="default"):
 
 # --- 3. Resolution Logic ---
 class TemplateRenderer:
-    def __init__(self, template_path, profile=None, region="us-east-1"):
+    def __init__(
+        self,
+        template_path,
+        profile=None,
+        region="us-east-1",
+        env_name="default",
+        log_level="WARN",
+    ):
         with open(template_path, "r") as f:
             self.t = yaml.load(f, Loader=CFNLoader)
 
         self.mappings = self.t.get("Mappings", {})
         self.conditions = self.t.get("Conditions", {})
         self.resources = self.t.get("Resources", {})
+        self.env_name = env_name
+        self.profile = profile
+        self.log_level_int = LOG_LEVELS.get(log_level.upper(), 30)
+
+        # Track current resource context for logging
+        self.current_resource_id = None
+        self.current_resource_type = None
 
         self.context = {
             "AWS::Region": region,
@@ -97,8 +127,14 @@ class TemplateRenderer:
             if "Default" in p:
                 self.context[name] = p["Default"]
 
+        self._init_boto_clients(region)
+
+    def _init_boto_clients(self, region):
+        """Initialize or re-initialize boto3 clients."""
         self.boto_session = (
-            boto3.Session(profile_name=profile, region_name=region) if profile else None
+            boto3.Session(profile_name=self.profile, region_name=region)
+            if self.profile
+            else None
         )
         self.cfn_client = (
             self.boto_session.client("cloudformation") if self.boto_session else None
@@ -106,6 +142,75 @@ class TemplateRenderer:
         self.sm_client = (
             self.boto_session.client("secretsmanager") if self.boto_session else None
         )
+
+    def _attempt_auto_login(self):
+        """Attempts to refresh credentials via AWS CLI SSO login."""
+        if not self.profile:
+            return False
+
+        self._log(
+            "AWS",
+            "Auth",
+            f"Token expired. Running 'aws sso login --profile {self.profile}'...",
+            level="WARN",
+        )
+        try:
+            # Interactive call to aws sso login
+            subprocess.check_call(["aws", "sso", "login", "--profile", self.profile])
+
+            # Refresh the session and clients to pick up new credentials
+            region = self.context.get("AWS::Region", "us-east-1")
+            self._init_boto_clients(region)
+
+            self._log(
+                "AWS", "Auth", "Login successful. Retrying operation.", level="INFO"
+            )
+            return True
+        except Exception as e:
+            self._log("AWS", "Auth", f"Auto-login failed: {e}", level="ERROR")
+            return False
+
+    def _log(self, operation, key, message=None, level="INFO"):
+        msg_level_int = LOG_LEVELS.get(level.upper(), 20)
+        if msg_level_int < self.log_level_int:
+            return
+
+        entry = {
+            "level": level,
+            "operation": operation,
+            "env": self.env_name,
+            "profile": self.profile,
+            "key": key,
+        }
+
+        if self.current_resource_id:
+            entry["resource_id"] = self.current_resource_id
+        if self.current_resource_type:
+            entry["resource_type"] = self.current_resource_type
+
+        if message:
+            entry["message"] = message
+        print(json.dumps(entry), file=sys.stderr)
+
+    def resolve_resources(self):
+        """Special resolver for the Resources block to track context."""
+        resolved = {}
+        for logical_id, res_def in self.resources.items():
+            self.current_resource_id = logical_id
+            self.current_resource_type = (
+                res_def.get("Type") if isinstance(res_def, dict) else None
+            )
+
+            # Resolve the resource definition
+            resolved_val = self.resolve(res_def)
+
+            if resolved_val is not None:
+                resolved[logical_id] = resolved_val
+
+        # Reset context
+        self.current_resource_id = None
+        self.current_resource_type = None
+        return resolved
 
     def resolve(self, node):
         if isinstance(node, dict):
@@ -188,7 +293,6 @@ class TemplateRenderer:
         if not isinstance(text, str):
             return text
 
-        # Pattern for {{resolve:service:...}}
         pattern = r"\{\{resolve:([^:]+):([^}]+)\}\}"
         match = re.search(pattern, text)
 
@@ -201,10 +305,9 @@ class TemplateRenderer:
         if service == "secretsmanager":
             return self._resolve_secretsmanager(reference)
 
-        # Unsupported service - return as-is
         return text
 
-    def _resolve_secretsmanager(self, reference):
+    def _resolve_secretsmanager(self, reference, retried=False):
         """Resolve a Secrets Manager reference."""
         parts = reference.split(":")
         secret_id = parts[0]
@@ -216,6 +319,7 @@ class TemplateRenderer:
                 response = sm_client.get_secret_value(SecretId=secret_id)
 
                 if "SecretBinary" in response:
+                    self._log("Resolve:SecretsManager", reference, level="INFO")
                     return str(response["SecretBinary"])
 
                 secret_string = response.get("SecretString", "")
@@ -226,14 +330,34 @@ class TemplateRenderer:
 
                         secret_data = json.loads(secret_string)
                         if json_key not in secret_data:
+                            self._log(
+                                "Resolve:SecretsManager",
+                                reference,
+                                f"Key {json_key} not found",
+                                level="ERROR",
+                            )
                             return f"{{Error: Key {json_key} not found in secret {secret_id}}}"
+                        self._log("Resolve:SecretsManager", reference, level="INFO")
                         return secret_data[json_key]
                     except json.JSONDecodeError:
+                        self._log(
+                            "Resolve:SecretsManager",
+                            reference,
+                            "Invalid JSON",
+                            level="ERROR",
+                        )
                         return f"{{Error: Secret is not valid JSON: {secret_id}}}"
 
+                self._log("Resolve:SecretsManager", reference, level="INFO")
                 return secret_string
 
-            except Exception:
+            except (ClientError, BotoCoreError) as e:
+                # Auto-login logic: if expired and we haven't retried yet
+                if "Token has expired" in str(e) and not retried:
+                    if self._attempt_auto_login():
+                        return self._resolve_secretsmanager(reference, retried=True)
+
+                self._log("Resolve:SecretsManager", reference, str(e), level="ERROR")
                 pass
 
         return f"mock-secret-{secret_id}"
@@ -242,14 +366,22 @@ class TemplateRenderer:
         m_name = self.resolve(args[0])
         top = self.resolve(args[1])
         sec = self.resolve(args[2])
+
+        key_str = f"{m_name}.{top}.{sec}"
         try:
-            return self.mappings[m_name][top][sec]
+            val = self.mappings[m_name][top][sec]
+            self._log("FindInMap", key_str, level="INFO")
+            return self.resolve(val)
         except (KeyError, TypeError):
             if len(args) > 3:
                 default_arg = args[3]
                 if isinstance(default_arg, dict) and "DefaultValue" in default_arg:
+                    self._log("FindInMap", key_str, "Used Default Value", level="WARN")
                     return self.resolve(default_arg["DefaultValue"])
+                self._log("FindInMap", key_str, "Used Default Value", level="WARN")
                 return self.resolve(default_arg)
+
+            self._log("FindInMap", key_str, "Key not found", level="ERROR")
             return f"{{Error: Could not resolve Map {m_name}.{top}.{sec}}}"
 
     def _handle_sub(self, args):
@@ -259,24 +391,37 @@ class TemplateRenderer:
         def repl(match):
             var = match.group(1)
             if var in vars_map:
-                return str(self.resolve(vars_map[var]))
+                val = str(self.resolve(vars_map[var]))
+                self._log("Sub", var, f"Resolved to: {val}", level="DEBUG")
+                return val
             if var in self.context:
-                return str(self.resolve(self.context[var]))
+                val = str(self.resolve(self.context[var]))
+                self._log("Sub", var, f"Resolved to: {val}", level="DEBUG")
+                return val
             if var in self.resources:
-                return f"mock-{var.lower()}-id"
+                val = f"mock-{var.lower()}-id"
+                self._log("Sub", var, f"Resolved to Mock: {val}", level="DEBUG")
+                return val
             return match.group(0)
 
         return re.sub(r"\${([^!][^}]*)}", repl, text)
 
-    def _handle_import(self, val):
+    def _handle_import(self, val, retried=False):
         import_name = self.resolve(val)
         if self.cfn_client:
             try:
                 exports = self.cfn_client.list_exports()
                 for exp in exports["Exports"]:
                     if exp["Name"] == import_name:
+                        self._log("ImportValue", import_name, level="INFO")
                         return exp["Value"]
-            except Exception:
+            except (ClientError, BotoCoreError) as e:
+                # Auto-login logic
+                if "Token has expired" in str(e) and not retried:
+                    if self._attempt_auto_login():
+                        return self._handle_import(val, retried=True)
+
+                self._log("ImportValue", import_name, str(e), level="ERROR")
                 pass
         return f"mock-import-{import_name}"
 
@@ -352,14 +497,18 @@ class TemplateRenderer:
         return self.resolve(result_node)
 
 
-def process(config, env, template, profile):
+# --- Processing Logic ---
+def process(config, env, template, profile, log_level="WARN"):
     sam_params = load_sam_config(config, env)
     region = sam_params.get("AWS::Region", "us-east-1")
 
-    renderer = TemplateRenderer(template, profile=profile, region=region)
+    renderer = TemplateRenderer(
+        template, profile=profile, region=region, env_name=env, log_level=log_level
+    )
     renderer.context.update(sam_params)
 
-    resolved_resources = renderer.resolve(renderer.resources)
+    # Use resolve_resources to track Logical ID context
+    resolved_resources = renderer.resolve_resources()
 
     output = {
         "Resources": resolved_resources,
@@ -369,7 +518,6 @@ def process(config, env, template, profile):
 
 
 def compare(a, b):
-    # Convert dictionaries to YAML strings for text comparison
     a_lines = yaml.dump(a[1], sort_keys=True).splitlines()
     b_lines = yaml.dump(b[1], sort_keys=True).splitlines()
 
@@ -381,7 +529,6 @@ def compare(a, b):
         lineterm="",
     )
 
-    # ANSI Color Codes
     RED = "\033[31m"
     GREEN = "\033[32m"
     CYAN = "\033[36m"
@@ -432,20 +579,21 @@ async def async_main():
     )
     parser.add_argument("--profile", help="AWS CLI Profile", default=None)
     parser.add_argument(
-        "--profile2",
-        help="AWS CLI Profile, used in conjunction with --env2",
-        default=None,
+        "--log-level",
+        help="Set logging level (DEBUG, INFO, WARN, ERROR)",
+        default="WARN",
+        type=str.upper,
+        choices=["DEBUG", "INFO", "WARN", "WARNING", "ERROR"],
     )
 
     args = parser.parse_args()
 
     if args.env2 is not None:
-        # Run both process calls in parallel threads
         task1 = asyncio.to_thread(
-            process, args.config, args.env, args.template, args.profile
+            process, args.config, args.env, args.template, args.profile, args.log_level
         )
         task2 = asyncio.to_thread(
-            process, args.config, args.env2, args.template, args.profile2
+            process, args.config, args.env2, args.template, args.profile, args.log_level
         )
 
         output1, output2 = await asyncio.gather(task1, task2)
@@ -453,9 +601,8 @@ async def async_main():
         diff = compare([args.env, output1], [args.env2, output2])
         print(diff)
     else:
-        # Run single process call
         output = await asyncio.to_thread(
-            process, args.config, args.env, args.template, args.profile
+            process, args.config, args.env, args.template, args.profile, args.log_level
         )
         print(yaml.dump(output))
 
