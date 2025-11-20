@@ -4,6 +4,7 @@ import re
 import sys
 import argparse
 import difflib
+import asyncio
 
 try:
     import tomllib as toml  # Python 3.11+
@@ -102,6 +103,9 @@ class TemplateRenderer:
         self.cfn_client = (
             self.boto_session.client("cloudformation") if self.boto_session else None
         )
+        self.sm_client = (
+            self.boto_session.client("secretsmanager") if self.boto_session else None
+        )
 
     def resolve(self, node):
         if isinstance(node, dict):
@@ -172,7 +176,6 @@ class TemplateRenderer:
     def _handle_ref(self, ref_key):
         if ref_key in self.context:
             result = self.context[ref_key]
-            # Recursively resolve in case the parameter contains a dynamic reference
             if isinstance(result, str):
                 return self._resolve_dynamic_reference(result)
             return result
@@ -203,25 +206,20 @@ class TemplateRenderer:
 
     def _resolve_secretsmanager(self, reference):
         """Resolve a Secrets Manager reference."""
-        # Parse the reference: secret-id:json-key:version-stage:version-id
         parts = reference.split(":")
         secret_id = parts[0]
         json_key = parts[1] if len(parts) > 1 else None
 
-        # Try to get the secret value if we have a boto session
         if self.boto_session:
             try:
                 sm_client = self.boto_session.client("secretsmanager")
                 response = sm_client.get_secret_value(SecretId=secret_id)
 
-                # Handle binary secrets
                 if "SecretBinary" in response:
                     return str(response["SecretBinary"])
 
-                # Handle string secrets
                 secret_string = response.get("SecretString", "")
 
-                # If a JSON key is specified, parse and extract
                 if json_key:
                     try:
                         import json
@@ -236,10 +234,8 @@ class TemplateRenderer:
                 return secret_string
 
             except Exception:
-                # Fall through to mock value
                 pass
 
-        # Return mock value if we can't resolve
         return f"mock-secret-{secret_id}"
 
     def _handle_map(self, args):
@@ -265,7 +261,7 @@ class TemplateRenderer:
             if var in vars_map:
                 return str(self.resolve(vars_map[var]))
             if var in self.context:
-                return str(self.context[var])
+                return str(self.resolve(self.context[var]))
             if var in self.resources:
                 return f"mock-{var.lower()}-id"
             return match.group(0)
@@ -311,7 +307,6 @@ class TemplateRenderer:
         return string.split(delim)
 
     def _handle_base64(self, val):
-        # Render as plain text for visibility, or real base64 if preferred
         resolved = self.resolve(val)
         return f"[Base64: {resolved}]"
 
@@ -321,7 +316,6 @@ class TemplateRenderer:
 
     def _handle_getazs(self, val):
         region = self.resolve(val)
-        # Return mock AZs based on the region string
         if not region:
             region = self.context["AWS::Region"]
         return [f"{region}a", f"{region}b", f"{region}c"]
@@ -376,7 +370,6 @@ def process(config, env, template, profile):
 
 def compare(a, b):
     # Convert dictionaries to YAML strings for text comparison
-    # sort_keys=True is crucial to prevent false diffs from random dict ordering
     a_lines = yaml.dump(a[1], sort_keys=True).splitlines()
     b_lines = yaml.dump(b[1], sort_keys=True).splitlines()
 
@@ -410,7 +403,7 @@ def compare(a, b):
     return "\n".join(colored_output)
 
 
-def main():
+async def async_main():
     parser = argparse.ArgumentParser(
         description="Render CloudFormation/SAM templates.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -438,17 +431,37 @@ def main():
         default=None,
     )
     parser.add_argument("--profile", help="AWS CLI Profile", default=None)
+    parser.add_argument(
+        "--profile2",
+        help="AWS CLI Profile, used in conjunction with --env2",
+        default=None,
+    )
 
     args = parser.parse_args()
 
-    output = process(args.config, args.env, args.template, args.profile)
-
     if args.env2 is not None:
-        output2 = process(args.config, args.env2, args.template, args.profile)
-        diff = compare([args.env, output], [args.env2, output2])
+        # Run both process calls in parallel threads
+        task1 = asyncio.to_thread(
+            process, args.config, args.env, args.template, args.profile
+        )
+        task2 = asyncio.to_thread(
+            process, args.config, args.env2, args.template, args.profile2
+        )
+
+        output1, output2 = await asyncio.gather(task1, task2)
+
+        diff = compare([args.env, output1], [args.env2, output2])
         print(diff)
     else:
+        # Run single process call
+        output = await asyncio.to_thread(
+            process, args.config, args.env, args.template, args.profile
+        )
         print(yaml.dump(output))
+
+
+def main():
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":
