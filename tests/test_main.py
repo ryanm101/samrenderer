@@ -7,6 +7,7 @@ from samrenderer.main import (
     load_sam_config,
     CFNLoader,
     main,
+    compare,  # Added import
 )
 
 
@@ -64,6 +65,78 @@ def test_main_cli_execution(capsys, simple_template):
         captured = capsys.readouterr()
         # Check if output contains resolved resource ID
         assert "mock-mybucket-id" in captured.out
+
+
+def test_main_cli_diff(capsys, simple_template, tmp_path):
+    """Test the main entrypoint with --env2 to trigger diff mode."""
+    # 1. Create a temporary samconfig.toml with two environments
+    # FIX: Remove indentation to ensure valid TOML
+    config_content = """version = 0.1
+[dev.deploy.parameters]
+parameter_overrides = "Env=\\\"dev\\\""
+
+[prod.deploy.parameters]
+parameter_overrides = "Env=\\\"prod\\\""
+"""
+    config_file = tmp_path / "samconfig.toml"
+    config_file.write_text(config_content, encoding="utf-8")
+
+    # 2. Run CLI with --env dev --env2 prod
+    args = [
+        "sam-render",
+        simple_template,
+        "--config",
+        str(config_file),
+        "--env",
+        "dev",
+        "--env2",
+        "prod",
+    ]
+
+    with patch("sys.argv", args):
+        main()
+        captured = capsys.readouterr()
+
+        # 3. Assert Diff Headers exist
+        assert "--- Environment dev" in captured.out
+        assert "+++ Environment prod" in captured.out
+
+        # 4. Assert specific changes (IsProd changes from false to true)
+        # Note: We look for substrings because exact spacing might vary
+        assert "IsProd: false" in captured.out  # Removed line (Red)
+        assert "IsProd: true" in captured.out  # Added line (Green)
+
+
+def test_compare_function():
+    """Test the compare logic and ANSI coloring."""
+    # Setup two dictionaries that differ
+    env1_data = {"Resources": {"Bucket": {"Properties": {"Name": "DevBucket"}}}}
+    env2_data = {"Resources": {"Bucket": {"Properties": {"Name": "ProdBucket"}}}}
+
+    # Call compare with [Name, Data] tuples
+    output = compare(["dev", env1_data], ["prod", env2_data])
+
+    # Check Headers
+    assert "--- Environment dev" in output
+    assert "+++ Environment prod" in output
+
+    # Check ANSI Color Codes
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    RESET = "\033[0m"
+
+    # Verify deletion (DevBucket) is Red
+    assert f"{RED}-      Name: DevBucket{RESET}" in output
+    # Verify addition (ProdBucket) is Green
+    assert f"{GREEN}+      Name: ProdBucket{RESET}" in output
+
+
+def test_compare_no_diff():
+    """Test compare with identical inputs returns empty string."""
+    data = {"Resources": {"Bucket": {"Type": "AWS::S3::Bucket"}}}
+    # Compare identical data
+    output = compare(["dev", data], ["dev", data])
+    assert output == ""
 
 
 def test_sam_config_missing_file():

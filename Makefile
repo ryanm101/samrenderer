@@ -35,3 +35,6 @@ clean:
 
 render-example: check-env
 	uv run sam-render examples/template.yml --config examples/samconfig.toml --env dev
+
+render-example-compare: check-env
+	uv run sam-render examples/template.yml --config examples/samconfig.toml --env dev --env2 stag
