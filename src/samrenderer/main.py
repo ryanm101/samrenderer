@@ -90,7 +90,37 @@ def load_sam_config(config_path, environment="default"):
         return {}
 
 
-# --- 3. Resolution Logic ---
+# --- 3. AWS Login Helper ---
+def ensure_sso_login(profile):
+    """
+    Checks if the session for the given profile is valid.
+    If not, triggers 'aws sso login'.
+    """
+    if not profile:
+        return
+
+    print(f"Checking credentials for profile '{profile}'...", file=sys.stderr)
+    try:
+        session = boto3.Session(profile_name=profile)
+        sts = session.client("sts")
+        sts.get_caller_identity()
+    except (ClientError, BotoCoreError):
+        print(
+            f"Credentials expired/invalid for '{profile}'. Running 'aws sso login'...",
+            file=sys.stderr,
+        )
+        try:
+            subprocess.check_call(["aws", "sso", "login", "--profile", profile])
+            print(f"Login successful for '{profile}'.", file=sys.stderr)
+        except subprocess.CalledProcessError:
+            print(
+                f"Error: Failed to login to AWS SSO for profile '{profile}'.",
+                file=sys.stderr,
+            )
+            # We don't exit here; we let the renderer fail naturally later if it needs creds
+
+
+# --- 4. Resolution Logic ---
 class TemplateRenderer:
     def __init__(
         self,
@@ -127,10 +157,7 @@ class TemplateRenderer:
             if "Default" in p:
                 self.context[name] = p["Default"]
 
-        self._init_boto_clients(region)
-
-    def _init_boto_clients(self, region):
-        """Initialize or re-initialize boto3 clients."""
+        # Initialize clients directly (assumes login handled externally)
         self.boto_session = (
             boto3.Session(profile_name=self.profile, region_name=region)
             if self.profile
@@ -142,33 +169,6 @@ class TemplateRenderer:
         self.sm_client = (
             self.boto_session.client("secretsmanager") if self.boto_session else None
         )
-
-    def _attempt_auto_login(self):
-        """Attempts to refresh credentials via AWS CLI SSO login."""
-        if not self.profile:
-            return False
-
-        self._log(
-            "AWS",
-            "Auth",
-            f"Token expired. Running 'aws sso login --profile {self.profile}'...",
-            level="WARN",
-        )
-        try:
-            # Interactive call to aws sso login
-            subprocess.check_call(["aws", "sso", "login", "--profile", self.profile])
-
-            # Refresh the session and clients to pick up new credentials
-            region = self.context.get("AWS::Region", "us-east-1")
-            self._init_boto_clients(region)
-
-            self._log(
-                "AWS", "Auth", "Login successful. Retrying operation.", level="INFO"
-            )
-            return True
-        except Exception as e:
-            self._log("AWS", "Auth", f"Auto-login failed: {e}", level="ERROR")
-            return False
 
     def _log(self, operation, key, message=None, level="INFO"):
         msg_level_int = LOG_LEVELS.get(level.upper(), 20)
@@ -307,7 +307,7 @@ class TemplateRenderer:
 
         return text
 
-    def _resolve_secretsmanager(self, reference, retried=False):
+    def _resolve_secretsmanager(self, reference):
         """Resolve a Secrets Manager reference."""
         parts = reference.split(":")
         secret_id = parts[0]
@@ -352,11 +352,6 @@ class TemplateRenderer:
                 return secret_string
 
             except (ClientError, BotoCoreError) as e:
-                # Auto-login logic: if expired and we haven't retried yet
-                if "Token has expired" in str(e) and not retried:
-                    if self._attempt_auto_login():
-                        return self._resolve_secretsmanager(reference, retried=True)
-
                 self._log("Resolve:SecretsManager", reference, str(e), level="ERROR")
                 pass
 
@@ -406,7 +401,7 @@ class TemplateRenderer:
 
         return re.sub(r"\${([^!][^}]*)}", repl, text)
 
-    def _handle_import(self, val, retried=False):
+    def _handle_import(self, val):
         import_name = self.resolve(val)
         if self.cfn_client:
             try:
@@ -416,11 +411,6 @@ class TemplateRenderer:
                         self._log("ImportValue", import_name, level="INFO")
                         return exp["Value"]
             except (ClientError, BotoCoreError) as e:
-                # Auto-login logic
-                if "Token has expired" in str(e) and not retried:
-                    if self._attempt_auto_login():
-                        return self._handle_import(val, retried=True)
-
                 self._log("ImportValue", import_name, str(e), level="ERROR")
                 pass
         return f"mock-import-{import_name}"
@@ -579,6 +569,11 @@ async def async_main():
     )
     parser.add_argument("--profile", help="AWS CLI Profile", default=None)
     parser.add_argument(
+        "--profile2",
+        help="AWS CLI Profile for the second environment (optional). Defaults to --profile.",
+        default=None,
+    )
+    parser.add_argument(
         "--log-level",
         help="Set logging level (DEBUG, INFO, WARN, ERROR)",
         default="WARN",
@@ -588,12 +583,22 @@ async def async_main():
 
     args = parser.parse_args()
 
+    # Determine profiles for both envs
+    prof1 = args.profile
+    prof2 = args.profile2 if args.profile2 else args.profile
+
+    # Check login for any profile that is set
+    profiles_to_check = set(p for p in [prof1, prof2] if p)
+    for p in profiles_to_check:
+        ensure_sso_login(p)
+
     if args.env2 is not None:
+        # Run both process calls in parallel threads
         task1 = asyncio.to_thread(
-            process, args.config, args.env, args.template, args.profile, args.log_level
+            process, args.config, args.env, args.template, prof1, args.log_level
         )
         task2 = asyncio.to_thread(
-            process, args.config, args.env2, args.template, args.profile, args.log_level
+            process, args.config, args.env2, args.template, prof2, args.log_level
         )
 
         output1, output2 = await asyncio.gather(task1, task2)
@@ -602,7 +607,7 @@ async def async_main():
         print(diff)
     else:
         output = await asyncio.to_thread(
-            process, args.config, args.env, args.template, args.profile, args.log_level
+            process, args.config, args.env, args.template, prof1, args.log_level
         )
         print(yaml.dump(output))
 

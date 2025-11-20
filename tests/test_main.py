@@ -2,6 +2,7 @@ import pytest
 import yaml
 import boto3
 from unittest.mock import patch, MagicMock
+from botocore.exceptions import ClientError
 from samrenderer.main import (
     TemplateRenderer,
     parse_sam_overrides,
@@ -96,6 +97,62 @@ parameter_overrides = "Env=\\\"prod\\\""
         assert "+++ Environment prod" in captured.out
         assert "IsProd: false" in captured.out
         assert "IsProd: true" in captured.out
+
+
+@patch("samrenderer.main.process")
+@patch("samrenderer.main.ensure_sso_login")
+def test_cli_profile_fallback(mock_login, mock_process, simple_template, tmp_path):
+    """Verify that if only --profile is set, it is used for both envs."""
+    # Create dummy config
+    config_file = tmp_path / "samconfig.toml"
+    config_file.write_text("", encoding="utf-8")
+
+    # Case 1: Only --profile set
+    args = [
+        "sam-render",
+        simple_template,
+        "--config",
+        str(config_file),
+        "--env",
+        "dev",
+        "--env2",
+        "prod",
+        "--profile",
+        "my-profile",
+    ]
+
+    # Mock process to return simple dicts to avoid diff errors
+    mock_process.return_value = {"Resources": {}}
+
+    with patch("sys.argv", args):
+        main()
+
+    # Expect 2 calls to process. Both should have 'my-profile' as the 4th arg
+    assert mock_process.call_count == 2
+
+    # Check args of all calls
+    # call_args_list is [call(args...), call(args...)]
+    # call args: (config, env, template, profile, log_level)
+    profiles_used = [c.args[3] for c in mock_process.call_args_list]
+    assert profiles_used == ["my-profile", "my-profile"]
+
+    # Expect login called once
+    mock_login.assert_called_once_with("my-profile")
+
+    # Reset mocks for Case 2
+    mock_process.reset_mock()
+    mock_login.reset_mock()
+
+    # Case 2: Both profiles set
+    args_two = args + ["--profile2", "prod-profile"]
+    with patch("sys.argv", args_two):
+        main()
+
+    profiles_used_2 = sorted([c.args[3] for c in mock_process.call_args_list])
+    assert profiles_used_2 == ["my-profile", "prod-profile"]
+
+    # Expect login called for both
+    assert mock_login.call_count == 2
 
 
 def test_compare_function():
@@ -242,7 +299,14 @@ def test_import_value_mock_aws(simple_template):
         assert r.resolve({"Fn::ImportValue": "MyExport"}) == "RealValue"
         assert r.resolve({"Fn::ImportValue": "Missing"}) == "mock-import-Missing"
 
-        mock_client.list_exports.side_effect = Exception("AWS Down")
+        # Raise a proper ClientError to test the exception handling
+        error_response = {
+            "Error": {"Code": "ServiceUnavailable", "Message": "AWS Down"}
+        }
+        mock_client.list_exports.side_effect = ClientError(
+            error_response, "ListExports"
+        )
+
         assert r.resolve({"Fn::ImportValue": "MyExport"}) == "mock-import-MyExport"
 
 
