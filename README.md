@@ -94,6 +94,23 @@ uv run sam-render template.yaml --config samconfig.toml --env dev --env2 dev1 --
 |          | Fn::GetAZs      | ⚠️     | Returns mock list based on Region (e.g., us-east-1a, 1b, 1c).      |
 | Dynamic  | {{resolve:...}} | ✅      | Supports Secrets Manager lookups (JSON & String) with `--profile`. |
 
+## Sample Outputs
+
+Example template snippet
+
+![LogGroupTemplate.png](docs/img/LogGroupTemplate.png)
+
+Example Map
+
+![Mappings.png](docs/img/Mappings.png)
+
+Default Render with lookups filled in
+
+![render.png](docs/img/render.png)
+
+Diff of two environments
+![Diff.png](docs/img/Diff.png)
+
 ## **Development & Testing**
 
 Makefile is used to provide consistency between local and remote builds.
