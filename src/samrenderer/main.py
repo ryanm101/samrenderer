@@ -34,13 +34,13 @@ def multi_constructor(loader, tag_suffix, node):
     elif isinstance(node, yaml.MappingNode):
         return {f"Fn::{tag}": loader.construct_mapping(node)}
 
+    return None
+
 
 CFNLoader.add_multi_constructor("!", multi_constructor)
 
 
 # --- 2. SAM Config Parsing ---
-
-
 def parse_sam_overrides(override_string):
     if not override_string:
         return {}
@@ -73,8 +73,6 @@ def load_sam_config(config_path, environment="default"):
 
 
 # --- 3. Resolution Logic ---
-
-
 class TemplateRenderer:
     def __init__(self, template_path, profile=None, region="us-east-1"):
         with open(template_path, "r") as f:
@@ -258,7 +256,6 @@ class TemplateRenderer:
         return [f"{region}a", f"{region}b", f"{region}c"]
 
     # --- Logic Handlers ---
-
     def _handle_equals(self, args):
         return self.resolve(args[0]) == self.resolve(args[1])
 

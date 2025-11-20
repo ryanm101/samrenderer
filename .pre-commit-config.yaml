@@ -10,5 +10,5 @@ repos:
     rev: v0.14.5
     hooks:
       - id: ruff-check
-        args: [ --fix --output-format=github ]
+        args: [ --output-format=github, --fix ]
       - id: ruff-format

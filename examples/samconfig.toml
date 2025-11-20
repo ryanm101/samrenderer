@@ -11,9 +11,9 @@ image_repositories = []
 signing_profiles = "APIFunction=\"SigningProfile_dev\""
 
 [dev1.deploy.parameters]
-stack_name = "dev-apistack"
+stack_name = "dev1-apistack"
 resolve_s3 = false
-s3_bucket = "dev-apibucket"
+s3_bucket = "dev1-apibucket"
 region = "eu-west-2"
 confirm_changeset = true
 capabilities = "CAPABILITY_NAMED_IAM"
