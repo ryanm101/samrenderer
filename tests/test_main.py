@@ -1,5 +1,6 @@
 import pytest
 import yaml
+import boto3
 from unittest.mock import patch, MagicMock
 from samrenderer.main import (
     TemplateRenderer,
@@ -7,6 +8,7 @@ from samrenderer.main import (
     load_sam_config,
     CFNLoader,
     main,
+    compare,
 )
 
 
@@ -58,29 +60,114 @@ def renderer(simple_template):
 
 def test_main_cli_execution(capsys, simple_template):
     """Test the main entrypoint via CLI arguments."""
-    # Simulate running: sam-render template.yaml
     with patch("sys.argv", ["sam-render", simple_template]):
         main()
         captured = capsys.readouterr()
-        # Check if output contains resolved resource ID
         assert "mock-mybucket-id" in captured.out
 
 
+def test_main_cli_diff(capsys, simple_template, tmp_path):
+    """Test the main entrypoint with --env2 to trigger diff mode."""
+    config_content = """version = 0.1
+[dev.deploy.parameters]
+parameter_overrides = "Env=\\\"dev\\\""
+
+[prod.deploy.parameters]
+parameter_overrides = "Env=\\\"prod\\\""
+"""
+    config_file = tmp_path / "samconfig.toml"
+    config_file.write_text(config_content, encoding="utf-8")
+
+    args = [
+        "sam-render",
+        simple_template,
+        "--config",
+        str(config_file),
+        "--env",
+        "dev",
+        "--env2",
+        "prod",
+    ]
+
+    with patch("sys.argv", args):
+        main()
+        captured = capsys.readouterr()
+        assert "--- Environment dev" in captured.out
+        assert "+++ Environment prod" in captured.out
+        assert "IsProd: false" in captured.out
+        assert "IsProd: true" in captured.out
+
+
+def test_compare_function():
+    """Test the compare logic and ANSI coloring."""
+    # Setup data with some shared lines (context) and some diffs
+    env1_data = {
+        "Resources": {
+            "Shared": {"Type": "AWS::S3::Bucket"},
+            "Bucket": {"Properties": {"Name": "DevBucket"}},
+        }
+    }
+    env2_data = {
+        "Resources": {
+            "Shared": {"Type": "AWS::S3::Bucket"},
+            "Bucket": {"Properties": {"Name": "ProdBucket"}},
+        }
+    }
+
+    output = compare(["dev", env1_data], ["prod", env2_data])
+
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    RESET = "\033[0m"
+
+    # Verify deletion and addition are colored
+    assert f"{RED}-      Name: DevBucket{RESET}" in output
+    assert f"{GREEN}+      Name: ProdBucket{RESET}" in output
+
+    # Verify context lines (shared) are present and NOT colored.
+    # The logic is: ' ' (diff prefix) + '  ' (yaml indent) = 3 spaces.
+    # We simply check that the string exists in the output without color codes prefixing it.
+    assert "   Shared:" in output
+    assert f"{RED}   Shared:" not in output
+
+
+def test_compare_no_diff():
+    data = {"Resources": {"Bucket": {"Type": "AWS::S3::Bucket"}}}
+    output = compare(["dev", data], ["dev", data])
+    assert output == ""
+
+
 def test_sam_config_missing_file():
-    """Test graceful failure when config file doesn't exist."""
-    # Should return empty dict and print warning to stderr
     assert load_sam_config("nonexistent_file.toml") == {}
 
 
 def test_sam_config_malformed(tmp_path):
-    """Test graceful failure with invalid TOML."""
     f = tmp_path / "bad.toml"
     f.write_text("This is not TOML", encoding="utf-8")
     assert load_sam_config(str(f)) == {}
 
 
+def test_sam_config_parsing_edge_cases():
+    """Test empty or None overrides."""
+    assert parse_sam_overrides("") == {}
+    assert parse_sam_overrides(None) == {}
+
+
+def test_sam_config_with_region(tmp_path):
+    """Test that region is extracted from SAM config."""
+    config_content = """version = 0.1
+[default.deploy.parameters]
+region = "eu-central-1"
+parameter_overrides = "Key=Val"
+"""
+    f = tmp_path / "samconfig.toml"
+    f.write_text(config_content, encoding="utf-8")
+
+    config = load_sam_config(str(f))
+    assert config["AWS::Region"] == "eu-central-1"
+
+
 def test_yaml_loader_complex_tags():
-    """Test custom YAML loader handles lists and dicts in tags."""
     yaml_str = """
     GetAttList: !GetAtt [Res, Attr]
     TagOnList: !MyTag [1, 2]
@@ -110,14 +197,11 @@ def test_find_in_map_standard(renderer):
 def test_find_in_map_default_value(renderer):
     node = {"Fn::FindInMap": ["ConfigMap", "dev", "InvalidKey", {"DefaultValue": 10}]}
     assert renderer.resolve(node) == 10
-
-    # Test direct value syntax
     node_direct = {"Fn::FindInMap": ["ConfigMap", "dev", "InvalidKey", 99]}
     assert renderer.resolve(node_direct) == 99
 
 
 def test_find_in_map_error(renderer):
-    """Test missing key without default value returns error string."""
     node = {"Fn::FindInMap": ["ConfigMap", "dev", "Missing"]}
     result = renderer.resolve(node)
     assert "Error: Could not resolve Map" in result
@@ -129,26 +213,23 @@ def test_sub_resolution(renderer):
 
 
 def test_sub_priority(renderer):
-    """Ensure variable precedence: Local > Context > Resources > Unknown."""
     renderer.resources["MyRes"] = {}
-
-    # 1. Local overrides everything
     assert renderer.resolve({"Fn::Sub": ["${Var}", {"Var": "local"}]}) == "local"
-    # 2. Context (Parameters/Pseudo)
     assert renderer.resolve({"Fn::Sub": "${AWS::Region}"}) == "us-east-1"
-    # 3. Resource Mock ID
     assert renderer.resolve({"Fn::Sub": "${MyRes}"}) == "mock-myres-id"
-    # 4. Unknown stays as is
     assert renderer.resolve({"Fn::Sub": "${Whoops}"}) == "${Whoops}"
 
 
 def test_import_value_mock_aws(simple_template):
-    """Test Fn::ImportValue with a mocked Boto3 client."""
-    with patch("boto3.Session") as mock_session:
-        mock_client = MagicMock()
-        mock_session.return_value.client.return_value = mock_client
+    with patch.object(boto3, "Session") as mock_session_cls:
+        # Explicitly create the session mock instance
+        mock_sess_inst = MagicMock()
+        mock_session_cls.return_value = mock_sess_inst
 
-        # Mock AWS response
+        mock_client = MagicMock()
+        # Attach return_value to the client method of the instance
+        mock_sess_inst.client.return_value = mock_client
+
         mock_client.list_exports.return_value = {
             "Exports": [
                 {"Name": "MyExport", "Value": "RealValue"},
@@ -156,53 +237,109 @@ def test_import_value_mock_aws(simple_template):
             ]
         }
 
-        # Initialize with profile to trigger boto3 logic
         r = TemplateRenderer(simple_template, profile="test-profile")
 
-        # Case 1: Export found
         assert r.resolve({"Fn::ImportValue": "MyExport"}) == "RealValue"
-        # Case 2: Export not found
         assert r.resolve({"Fn::ImportValue": "Missing"}) == "mock-import-Missing"
-        # Case 3: AWS Error (Client fails), fallback to mock
+
         mock_client.list_exports.side_effect = Exception("AWS Down")
         assert r.resolve({"Fn::ImportValue": "MyExport"}) == "mock-import-MyExport"
 
 
+def test_secrets_manager_edge_cases(simple_template):
+    """Test binary secrets, invalid JSON, and missing keys."""
+    with patch.object(boto3, "Session") as mock_session_cls:
+        mock_sess_inst = MagicMock()
+        mock_session_cls.return_value = mock_sess_inst
+
+        mock_sm = MagicMock()
+
+        # Correct side_effect signature and logic
+        def client_side_effect(service_name, **kwargs):
+            if service_name == "secretsmanager":
+                return mock_sm
+            return MagicMock()
+
+        # Important: Set side_effect on the .client method of the session instance
+        mock_sess_inst.client.side_effect = client_side_effect
+
+        r = TemplateRenderer(simple_template, profile="test-profile")
+
+        # 1. Binary Secret (SecretString is None)
+        mock_sm.get_secret_value.return_value = {"SecretBinary": b"binary_data"}
+        # Ensure we convert bytes to string representation for assertion
+        assert r.resolve("{{resolve:secretsmanager:BinarySecret}}") == "b'binary_data'"
+
+        # 2. Invalid JSON
+        mock_sm.get_secret_value.return_value = {"SecretString": "not_json"}
+        res = r.resolve("{{resolve:secretsmanager:BadJson:Key}}")
+        assert "Error: Secret is not valid JSON" in res
+
+        # 3. Missing Key in JSON
+        mock_sm.get_secret_value.return_value = {"SecretString": '{"Foo": "Bar"}'}
+        res = r.resolve("{{resolve:secretsmanager:MissingKey:Baz}}")
+        assert "Error: Key Baz not found" in res
+
+
+def test_ref_to_dynamic_reference(simple_template):
+    """Test that !Ref to a parameter containing {{resolve...}} recursively resolves it."""
+    with patch.object(boto3, "Session") as mock_session_cls:
+        mock_sess_inst = MagicMock()
+        mock_session_cls.return_value = mock_sess_inst
+
+        mock_sm = MagicMock()
+
+        def client_side_effect(service_name, **kwargs):
+            if service_name == "secretsmanager":
+                return mock_sm
+            return MagicMock()
+
+        mock_sess_inst.client.side_effect = client_side_effect
+        mock_sm.get_secret_value.return_value = {"SecretString": "SecretValue"}
+
+        # Setup renderer
+        r = TemplateRenderer(simple_template, profile="test-profile")
+        # Inject parameter with dynamic ref
+        r.context["MyParam"] = "{{resolve:secretsmanager:MySecret}}"
+
+        # Resolve !Ref MyParam
+        assert r.resolve({"Ref": "MyParam"}) == "SecretValue"
+
+
 def test_split_select_success(renderer):
-    """Test successful Split and Select operations."""
-    # Split "a,b,c" -> ["a","b","c"], Select index 1 -> "b"
     node = {"Fn::Select": ["1", {"Fn::Split": [",", "a,b,c"]}]}
     assert renderer.resolve(node) == "b"
 
 
 def test_select_edge_cases(renderer):
-    # Index out of bounds
     node = {"Fn::Select": ["5", ["a", "b"]]}
     assert "Error: Select index 5" in renderer.resolve(node)
 
 
 def test_length_edge_cases(renderer):
-    # Not a list
     node = {"Fn::Length": "NotAList"}
     assert renderer.resolve(node) == 0
-    # List
     node_list = {"Fn::Length": ["a", "b"]}
     assert renderer.resolve(node_list) == 2
 
 
 def test_getazs(renderer):
-    # Explicit region
     node = {"Fn::GetAZs": "eu-west-1"}
     assert renderer.resolve(node) == ["eu-west-1a", "eu-west-1b", "eu-west-1c"]
-
-    # Implicit region (empty string) -> uses context region
     node_implicit = {"Fn::GetAZs": ""}
     assert renderer.resolve(node_implicit) == ["us-east-1a", "us-east-1b", "us-east-1c"]
 
 
 def test_condition_missing(renderer):
-    """Test referring to a Condition that doesn't exist in the template."""
     assert renderer.resolve({"Condition": "NonExistent"}) is False
+
+
+def test_fn_condition_explicit(renderer):
+    """Test explicit Fn::Condition dict usage."""
+    # Assuming 'IsProd' exists in the renderer (from simple_template fixture)
+    # IsProd depends on Env=dev (Default), so it is False.
+    assert renderer.resolve({"Fn::Condition": "IsProd"}) is False
+    assert renderer.resolve({"Fn::Condition": "IsNotProd"}) is True
 
 
 # --- Logic Tests (Existing) ---

@@ -3,10 +3,11 @@ import boto3
 import re
 import sys
 import argparse
+import difflib
 
 try:
     import tomllib as toml  # Python 3.11+
-except ImportError:
+except ImportError:  # pragma: no cover
     import tomli as toml  # pip install tomli
 
 
@@ -160,16 +161,86 @@ class TemplateRenderer:
             # Filter out AWS::NoValue (None) from lists
             return [r for x in node if (r := self.resolve(x)) is not None]
 
+        elif isinstance(node, str):
+            # Check for CloudFormation dynamic references
+            return self._resolve_dynamic_reference(node)
+
         return node
 
     # --- Intrinsic Handlers ---
 
     def _handle_ref(self, ref_key):
         if ref_key in self.context:
-            return self.context[ref_key]
+            result = self.context[ref_key]
+            # Recursively resolve in case the parameter contains a dynamic reference
+            if isinstance(result, str):
+                return self._resolve_dynamic_reference(result)
+            return result
         if ref_key in self.resources:
             return f"mock-{ref_key.lower()}-id"
         return f"{{Ref: {ref_key}}}"
+
+    def _resolve_dynamic_reference(self, text):
+        """Resolve CloudFormation dynamic references like {{resolve:secretsmanager:...}}"""
+        if not isinstance(text, str):
+            return text
+
+        # Pattern for {{resolve:service:...}}
+        pattern = r"\{\{resolve:([^:]+):([^}]+)\}\}"
+        match = re.search(pattern, text)
+
+        if not match:
+            return text
+
+        service = match.group(1)
+        reference = match.group(2)
+
+        if service == "secretsmanager":
+            return self._resolve_secretsmanager(reference)
+
+        # Unsupported service - return as-is
+        return text
+
+    def _resolve_secretsmanager(self, reference):
+        """Resolve a Secrets Manager reference."""
+        # Parse the reference: secret-id:json-key:version-stage:version-id
+        parts = reference.split(":")
+        secret_id = parts[0]
+        json_key = parts[1] if len(parts) > 1 else None
+
+        # Try to get the secret value if we have a boto session
+        if self.boto_session:
+            try:
+                sm_client = self.boto_session.client("secretsmanager")
+                response = sm_client.get_secret_value(SecretId=secret_id)
+
+                # Handle binary secrets
+                if "SecretBinary" in response:
+                    return str(response["SecretBinary"])
+
+                # Handle string secrets
+                secret_string = response.get("SecretString", "")
+
+                # If a JSON key is specified, parse and extract
+                if json_key:
+                    try:
+                        import json
+
+                        secret_data = json.loads(secret_string)
+                        if json_key not in secret_data:
+                            return f"{{Error: Key {json_key} not found in secret {secret_id}}}"
+                        return secret_data[json_key]
+                    except json.JSONDecodeError:
+                        return f"{{Error: Secret is not valid JSON: {secret_id}}}"
+
+                return secret_string
+
+            except Exception:
+                # Fall through to mock value
+                pass
+
+        # Return mock value if we can't resolve
+        return f"mock-secret-{secret_id}"
 
     def _handle_map(self, args):
         m_name = self.resolve(args[0])
@@ -287,23 +358,11 @@ class TemplateRenderer:
         return self.resolve(result_node)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Render CloudFormation/SAM templates.")
-    parser.add_argument("template", help="Path to template.yaml")
-    parser.add_argument(
-        "--config", help="Path to samconfig.toml", default="samconfig.toml"
-    )
-    parser.add_argument(
-        "--env", help="Environment name in samconfig (e.g., dev)", default="default"
-    )
-    parser.add_argument("--profile", help="AWS CLI Profile", default=None)
-
-    args = parser.parse_args()
-
-    sam_params = load_sam_config(args.config, args.env)
+def process(config, env, template, profile):
+    sam_params = load_sam_config(config, env)
     region = sam_params.get("AWS::Region", "us-east-1")
 
-    renderer = TemplateRenderer(args.template, profile=args.profile, region=region)
+    renderer = TemplateRenderer(template, profile=profile, region=region)
     renderer.context.update(sam_params)
 
     resolved_resources = renderer.resolve(renderer.resources)
@@ -312,8 +371,84 @@ def main():
         "Resources": resolved_resources,
         "Conditions": renderer.resolve(renderer.conditions),
     }
+    return output
 
-    print(yaml.dump(output))
+
+def compare(a, b):
+    # Convert dictionaries to YAML strings for text comparison
+    # sort_keys=True is crucial to prevent false diffs from random dict ordering
+    a_lines = yaml.dump(a[1], sort_keys=True).splitlines()
+    b_lines = yaml.dump(b[1], sort_keys=True).splitlines()
+
+    diff = difflib.unified_diff(
+        a_lines,
+        b_lines,
+        fromfile=f"Environment {a[0]}",
+        tofile=f"Environment {b[0]}",
+        lineterm="",
+    )
+
+    # ANSI Color Codes
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    CYAN = "\033[36m"
+    RESET = "\033[0m"
+
+    colored_output = []
+    for line in diff:
+        if line.startswith("---") or line.startswith("+++"):
+            colored_output.append(f"{CYAN}{line}{RESET}")
+        elif line.startswith("-"):
+            colored_output.append(f"{RED}{line}{RESET}")
+        elif line.startswith("+"):
+            colored_output.append(f"{GREEN}{line}{RESET}")
+        elif line.startswith("@@"):
+            colored_output.append(f"{CYAN}{line}{RESET}")
+        else:
+            colored_output.append(line)
+
+    return "\n".join(colored_output)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Render CloudFormation/SAM templates.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+      # Basic render of 'dev' environment
+      sam-render template.yaml --config samconfig.toml --env dev
+
+      # Render with AWS profile for real value lookups
+      sam-render template.yaml --env dev --profile my-profile
+
+      # Compare 'dev' and 'stag' environments (Colored Diff)
+      sam-render template.yaml --env dev --env2 stag
+    """,
+    )
+    parser.add_argument("template", help="Path to template.yaml")
+    parser.add_argument(
+        "--config", help="Path to samconfig.toml", default="samconfig.toml"
+    )
+    parser.add_argument(
+        "--env", help="Environment name in samconfig (e.g., dev)", default="default"
+    )
+    parser.add_argument(
+        "--env2",
+        help="Second Environment name in samconfig (e.g., stag), used to diff the first environment against.",
+        default=None,
+    )
+    parser.add_argument("--profile", help="AWS CLI Profile", default=None)
+
+    args = parser.parse_args()
+
+    output = process(args.config, args.env, args.template, args.profile)
+
+    if args.env2 is not None:
+        output2 = process(args.config, args.env2, args.template, args.profile)
+        diff = compare([args.env, output], [args.env2, output2])
+        print(diff)
+    else:
+        print(yaml.dump(output))
 
 
 if __name__ == "__main__":
