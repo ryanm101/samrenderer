@@ -67,6 +67,10 @@ Resources:
         Variables:
           # Example usage of the VpcStackName parameter
           VPC_STACK_ID: !Ref VpcStackName
+          BAD_VAR: !FindInMap
+            - EnvironmentConfiguration
+            - !Ref SubEnvironment
+            - nonExistentKey
       Events:
         ApiEvent:
           Type: Api
