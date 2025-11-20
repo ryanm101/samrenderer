@@ -161,16 +161,86 @@ class TemplateRenderer:
             # Filter out AWS::NoValue (None) from lists
             return [r for x in node if (r := self.resolve(x)) is not None]
 
+        elif isinstance(node, str):
+            # Check for CloudFormation dynamic references
+            return self._resolve_dynamic_reference(node)
+
         return node
 
     # --- Intrinsic Handlers ---
 
     def _handle_ref(self, ref_key):
         if ref_key in self.context:
-            return self.context[ref_key]
+            result = self.context[ref_key]
+            # Recursively resolve in case the parameter contains a dynamic reference
+            if isinstance(result, str):
+                return self._resolve_dynamic_reference(result)
+            return result
         if ref_key in self.resources:
             return f"mock-{ref_key.lower()}-id"
         return f"{{Ref: {ref_key}}}"
+
+    def _resolve_dynamic_reference(self, text):
+        """Resolve CloudFormation dynamic references like {{resolve:secretsmanager:...}}"""
+        if not isinstance(text, str):
+            return text
+
+        # Pattern for {{resolve:service:...}}
+        pattern = r"\{\{resolve:([^:]+):([^}]+)\}\}"
+        match = re.search(pattern, text)
+
+        if not match:
+            return text
+
+        service = match.group(1)
+        reference = match.group(2)
+
+        if service == "secretsmanager":
+            return self._resolve_secretsmanager(reference)
+
+        # Unsupported service - return as-is
+        return text
+
+    def _resolve_secretsmanager(self, reference):
+        """Resolve a Secrets Manager reference."""
+        # Parse the reference: secret-id:json-key:version-stage:version-id
+        parts = reference.split(":")
+        secret_id = parts[0]
+        json_key = parts[1] if len(parts) > 1 else None
+
+        # Try to get the secret value if we have a boto session
+        if self.boto_session:
+            try:
+                sm_client = self.boto_session.client("secretsmanager")
+                response = sm_client.get_secret_value(SecretId=secret_id)
+
+                # Handle binary secrets
+                if "SecretBinary" in response:
+                    return str(response["SecretBinary"])
+
+                # Handle string secrets
+                secret_string = response.get("SecretString", "")
+
+                # If a JSON key is specified, parse and extract
+                if json_key:
+                    try:
+                        import json
+
+                        secret_data = json.loads(secret_string)
+                        if json_key not in secret_data:
+                            return f"{{Error: Key {json_key} not found in secret {secret_id}}}"
+                        return secret_data[json_key]
+                    except json.JSONDecodeError:
+                        return f"{{Error: Secret is not valid JSON: {secret_id}}}"
+
+                return secret_string
+
+            except Exception:
+                # Fall through to mock value
+                pass
+
+        # Return mock value if we can't resolve
+        return f"mock-secret-{secret_id}"
 
     def _handle_map(self, args):
         m_name = self.resolve(args[0])

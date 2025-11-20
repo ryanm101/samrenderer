@@ -1,5 +1,6 @@
 import pytest
 import yaml
+import boto3
 from unittest.mock import patch, MagicMock
 from samrenderer.main import (
     TemplateRenderer,
@@ -123,10 +124,11 @@ def test_compare_function():
     assert f"{RED}-      Name: DevBucket{RESET}" in output
     assert f"{GREEN}+      Name: ProdBucket{RESET}" in output
 
-    # Verify context lines (shared) are present and NOT colored
-    # Note: unified_diff adds 1 space prefix, plus YAML adds 2 spaces = 3 spaces total
+    # Verify context lines (shared) are present and NOT colored.
+    # The logic is: ' ' (diff prefix) + '  ' (yaml indent) = 3 spaces.
+    # We simply check that the string exists in the output without color codes prefixing it.
     assert "   Shared:" in output
-    assert f"{RED}   Shared:{RESET}" not in output
+    assert f"{RED}   Shared:" not in output
 
 
 def test_compare_no_diff():
@@ -219,9 +221,15 @@ def test_sub_priority(renderer):
 
 
 def test_import_value_mock_aws(simple_template):
-    with patch("boto3.Session") as mock_session:
+    with patch.object(boto3, "Session") as mock_session_cls:
+        # Explicitly create the session mock instance
+        mock_sess_inst = MagicMock()
+        mock_session_cls.return_value = mock_sess_inst
+
         mock_client = MagicMock()
-        mock_session.return_value.client.return_value = mock_client
+        # Attach return_value to the client method of the instance
+        mock_sess_inst.client.return_value = mock_client
+
         mock_client.list_exports.return_value = {
             "Exports": [
                 {"Name": "MyExport", "Value": "RealValue"},
@@ -236,6 +244,66 @@ def test_import_value_mock_aws(simple_template):
 
         mock_client.list_exports.side_effect = Exception("AWS Down")
         assert r.resolve({"Fn::ImportValue": "MyExport"}) == "mock-import-MyExport"
+
+
+def test_secrets_manager_edge_cases(simple_template):
+    """Test binary secrets, invalid JSON, and missing keys."""
+    with patch.object(boto3, "Session") as mock_session_cls:
+        mock_sess_inst = MagicMock()
+        mock_session_cls.return_value = mock_sess_inst
+
+        mock_sm = MagicMock()
+
+        # Correct side_effect signature and logic
+        def client_side_effect(service_name, **kwargs):
+            if service_name == "secretsmanager":
+                return mock_sm
+            return MagicMock()
+
+        # Important: Set side_effect on the .client method of the session instance
+        mock_sess_inst.client.side_effect = client_side_effect
+
+        r = TemplateRenderer(simple_template, profile="test-profile")
+
+        # 1. Binary Secret (SecretString is None)
+        mock_sm.get_secret_value.return_value = {"SecretBinary": b"binary_data"}
+        # Ensure we convert bytes to string representation for assertion
+        assert r.resolve("{{resolve:secretsmanager:BinarySecret}}") == "b'binary_data'"
+
+        # 2. Invalid JSON
+        mock_sm.get_secret_value.return_value = {"SecretString": "not_json"}
+        res = r.resolve("{{resolve:secretsmanager:BadJson:Key}}")
+        assert "Error: Secret is not valid JSON" in res
+
+        # 3. Missing Key in JSON
+        mock_sm.get_secret_value.return_value = {"SecretString": '{"Foo": "Bar"}'}
+        res = r.resolve("{{resolve:secretsmanager:MissingKey:Baz}}")
+        assert "Error: Key Baz not found" in res
+
+
+def test_ref_to_dynamic_reference(simple_template):
+    """Test that !Ref to a parameter containing {{resolve...}} recursively resolves it."""
+    with patch.object(boto3, "Session") as mock_session_cls:
+        mock_sess_inst = MagicMock()
+        mock_session_cls.return_value = mock_sess_inst
+
+        mock_sm = MagicMock()
+
+        def client_side_effect(service_name, **kwargs):
+            if service_name == "secretsmanager":
+                return mock_sm
+            return MagicMock()
+
+        mock_sess_inst.client.side_effect = client_side_effect
+        mock_sm.get_secret_value.return_value = {"SecretString": "SecretValue"}
+
+        # Setup renderer
+        r = TemplateRenderer(simple_template, profile="test-profile")
+        # Inject parameter with dynamic ref
+        r.context["MyParam"] = "{{resolve:secretsmanager:MySecret}}"
+
+        # Resolve !Ref MyParam
+        assert r.resolve({"Ref": "MyParam"}) == "SecretValue"
 
 
 def test_split_select_success(renderer):
