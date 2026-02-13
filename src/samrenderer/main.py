@@ -134,6 +134,8 @@ class TemplateRenderer:
             self.t = yaml.load(f, Loader=CFNLoader)
 
         self.mappings = self.t.get("Mappings", {})
+        self.transform = self.t.get("Transform", [])
+        self.awstempver = self.t.get("AWSTemplateFormatVersion", "")
         self.conditions = self.t.get("Conditions", {})
         self.resources = self.t.get("Resources", {})
         self.env_name = env_name
@@ -501,6 +503,8 @@ def process(config, env, template, profile, log_level="WARN"):
     resolved_resources = renderer.resolve_resources()
 
     output = {
+        "AWSTemplateFormatVersion": renderer.awstempver,
+        "Transform": renderer.transform,
         "Resources": resolved_resources,
         "Conditions": renderer.resolve(renderer.conditions),
     }
@@ -609,6 +613,10 @@ async def async_main():
         output = await asyncio.to_thread(
             process, args.config, args.env, args.template, prof1, args.log_level
         )
+        print(
+            f"AWSTemplateFormatVersion: {yaml.dump(output.pop('AWSTemplateFormatVersion'))}"
+        )
+        print(f"Transform:\n{yaml.dump(output.pop('Transform'))}")
         print(yaml.dump(output))
 
 
